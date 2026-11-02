@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: nilicad-occt
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeployTrigger: commit
