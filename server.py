@@ -47,8 +47,8 @@ def make(node,level=0):
     # Three.js box uses (x,z,y), Y is vertical
     if t in ('box','extrudeRect'):
         shape=cq.Workplane('XY').box(x,z,y,centered=(True,True,True)).val()
-        # CadQuery axes X,Y,Z -> Three X,Z,Y: rotation about X -90 degrees
-        shape=shape.rotate((0,0,0),(1,0,0),-90)
+        # CadQuery box(x,z,y) already matches Three.js box(x,z,y).
+        # Do not rotate: that would swap the vertical and depth axes.
     elif t in ('cylinder','extrudeCircle'):
         shape=cq.Workplane('XY').circle(x/2).extrude(z/2,both=True).val()
         shape=shape.rotate((0,0,0),(1,0,0),-90)
