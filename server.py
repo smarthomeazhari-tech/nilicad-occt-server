@@ -1,8 +1,8 @@
 
 """NiliCAD experimental OCCT STEP backend. Run with uvicorn server:app --host 0.0.0.0 --port 8765."""
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Any
 import cadquery as cq
@@ -12,7 +12,7 @@ from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.TopoDS import TopoDS_Compound
 from OCP.BRep import BRep_Builder
-import tempfile, os, math
+import tempfile, os, math, time, uuid, re, threading
 
 app=FastAPI(title="NiliCAD OCCT STEP bridge")
 app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["POST","GET"],allow_headers=["*"])
@@ -94,3 +94,92 @@ def export_step(model:Model):
         finally:os.unlink(path)
         return Response(data,media_type='model/step',headers={'Content-Disposition':'attachment; filename="NiliCAD-precise.step"'})
     except Exception as exc:raise HTTPException(422,str(exc))
+
+
+# Two-stage STEP delivery. Jobs are local to this Render instance and expire.
+_STEP_DIR = os.path.join(tempfile.gettempdir(), 'nilicad-step-jobs')
+os.makedirs(_STEP_DIR, exist_ok=True)
+_STEP_TTL = 3600
+_STEP_LOCK = threading.Lock()
+_STEP_JOBS = {}
+
+def _cleanup_step_jobs():
+    now = time.time()
+    with _STEP_LOCK:
+        for key, (path, created) in list(_STEP_JOBS.items()):
+            if now - created > _STEP_TTL:
+                _STEP_JOBS.pop(key, None)
+                try: os.unlink(path)
+                except OSError: pass
+
+def _write_step(model, path):
+    if not model.objects or len(model.objects) > 100:
+        raise ValueError('Expected 1–100 objects')
+    writer = STEPControl_Writer()
+    for node in model.objects:
+        shape = orient_for_step(make(node))
+        if writer.Transfer(shape.wrapped, STEPControl_AsIs) != IFSelect_RetDone:
+            raise ValueError('OCCT could not transfer shape to STEP')
+    if writer.Write(path) != IFSelect_RetDone:
+        raise ValueError('OCCT STEP writer failed')
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError('Generated STEP is empty')
+    return size
+
+@app.post('/prepare-step')
+def prepare_step(model: Model):
+    _cleanup_step_jobs()
+    job_id = uuid.uuid4().hex
+    path = os.path.join(_STEP_DIR, job_id + '.step')
+    try:
+        size = _write_step(model, path)
+        with _STEP_LOCK:
+            _STEP_JOBS[job_id] = (path, time.time())
+        return {'job_id': job_id, 'size': size, 'download_url': '/download-step/' + job_id, 'expires_in_seconds': _STEP_TTL}
+    except Exception as exc:
+        try: os.unlink(path)
+        except OSError: pass
+        raise HTTPException(422, str(exc))
+
+@app.get('/download-step/{job_id}')
+def download_step(job_id: str, range_header: str | None = Header(default=None, alias='Range')):
+    _cleanup_step_jobs()
+    if not re.fullmatch(r'[a-f0-9]{32}', job_id):
+        raise HTTPException(404, 'STEP job not found')
+    with _STEP_LOCK:
+        job = _STEP_JOBS.get(job_id)
+    if not job or not os.path.isfile(job[0]):
+        raise HTTPException(404, 'STEP file expired or unavailable; generate it again')
+    path = job[0]
+    size = os.path.getsize(path)
+    start, end = 0, size - 1
+    headers = {'Accept-Ranges': 'bytes', 'Content-Disposition': 'attachment; filename="NiliCAD-precise.step"', 'Cache-Control': 'no-store', 'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Disposition'}
+    status = 200
+    if range_header:
+        match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_header.strip())
+        if not match or (not match.group(1) and not match.group(2)):
+            return Response(status_code=416, headers={**headers, 'Content-Range': f'bytes */{size}'})
+        if not match.group(1):
+            suffix = int(match.group(2))
+            start = max(0, size - suffix) if suffix else size
+        else:
+            start = int(match.group(1))
+        if match.group(1) and match.group(2):
+            end = min(int(match.group(2)), size - 1)
+        if start >= size or end < start:
+            return Response(status_code=416, headers={**headers, 'Content-Range': f'bytes */{size}'})
+        status = 206
+        headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    length = end - start + 1
+    headers['Content-Length'] = str(length)
+    def chunks():
+        with open(path, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            while remaining:
+                block = f.read(min(64 * 1024, remaining))
+                if not block: break
+                remaining -= len(block)
+                yield block
+    return StreamingResponse(chunks(), status_code=status, media_type='model/step', headers=headers)
