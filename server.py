@@ -30,6 +30,18 @@ def apply_transform(shape,mat):
                  a[2],a[6],a[10],a[14])
     return cq.Shape(BRepBuilderAPI_Transform(shape.wrapped,tr,True).Shape())
 
+def orient_for_step(shape):
+    """Convert Three.js Y-up model coordinates to STEP Z-up coordinates.
+
+    Rotation +90 degrees about X: (x, y, z) -> (x, -z, y).
+    Apply only after all modeling and Boolean operations are complete.
+    """
+    tr = gp_Trsf()
+    tr.SetValues(1, 0, 0, 0,
+                 0, 0, -1, 0,
+                 0, 1, 0, 0)
+    return cq.Shape(BRepBuilderAPI_Transform(shape.wrapped, tr, True).Shape())
+
 def make(node,level=0):
     if level>40: raise ValueError("Feature tree too deep")
     if node.get('op')=='transform':
@@ -73,7 +85,7 @@ def export_step(model:Model):
         if not model.objects or len(model.objects)>100:raise ValueError('Expected 1–100 objects')
         writer=STEPControl_Writer()
         for node in model.objects:
-            shape=make(node)
+            shape=orient_for_step(make(node))
             writer.Transfer(shape.wrapped,STEPControl_AsIs)
         with tempfile.NamedTemporaryFile(suffix='.step',delete=False) as f: path=f.name
         try:
