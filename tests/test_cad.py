@@ -14,6 +14,22 @@ class GeometryTests(unittest.TestCase):
     def setUp(self):
         self.client=TestClient(app)
 
+    def test_single_duplicate_and_disjoint_profiles(self):
+        for profiles,expected in [([rect(0,0,10,10)],1),([rect(0,0,10,10),rect(0,0,10,10)],1),([rect(0,0,10,10),rect(20,0,10,10)],2)]:
+            regions=cad.split_profiles(profiles)
+            self.assertEqual(len(regions),expected)
+            self.assertAlmostEqual(sum(r['area'] for r in regions),100*expected)
+
+    def test_empty_boolean_and_profile_validation(self):
+        box={'type':'box','dims':{'x':10,'y':10,'z':10}}
+        moved={**box,'transform':[1,0,0,0,0,1,0,0,0,0,1,0,100,0,0,1]}
+        data=self.client.post('/evaluate',json={'op':'intersect','left':box,'right':moved}).json()
+        self.assertEqual(data['volume'],0)
+        self.assertEqual(data['indices'],[])
+        bad=rect(0,0,10,10);bad['segments'].pop()
+        self.assertEqual(self.client.post('/regions',json={'profiles':[bad]}).status_code,422)
+        self.assertEqual(self.client.post('/evaluate',json={**box,'transform':[1]*16}).status_code,422)
+
     def test_overlap_regions(self):
         response=self.client.post('/regions',json={'profiles':[rect(0,0,10,10),rect(5,0,10,10)]})
         self.assertEqual(response.status_code,200,response.text)
