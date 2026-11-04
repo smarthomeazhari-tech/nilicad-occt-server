@@ -6,6 +6,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Any
 import cadquery as cq
+import cad
 from OCP.gp import gp_Trsf, gp_Mat, gp_XYZ
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
@@ -23,7 +24,9 @@ class Model(BaseModel):
 def apply_transform(shape,mat):
     if not isinstance(mat,list) or len(mat)!=16:
         raise ValueError('Invalid transformation matrix')
-    a=[float(v) for v in mat]
+    a=[cad.finite(v) for v in mat]
+    if any(abs(a[i]-v)>1e-9 for i,v in [(3,0),(7,0),(11,0),(15,1)]):
+        raise ValueError('Expected affine transformation matrix')
     tr=gp_Trsf()
     tr.SetValues(a[0],a[4],a[8],a[12],
                  a[1],a[5],a[9],a[13],
@@ -53,8 +56,14 @@ def make(node,level=0):
         if op=='subtract':return a.cut(b)
         if op=='intersect':return a.intersect(b)
         raise ValueError('Unknown boolean operation')
+    if node.get('type')=='brep':
+        shape=cad.load(node['brep'])
+        return apply_transform(shape,node['transform']) if node.get('transform') else shape
+    if node.get('type')=='profile':
+        shape=cad.extrude(node)
+        return apply_transform(shape,node['transform']) if node.get('transform') else shape
     t=node['type'];d=node.get('dims') or {}
-    x=float(d.get('x',40));y=float(d.get('y',30));z=float(d.get('z',20))
+    x=cad.finite(d.get('x',40));y=cad.finite(d.get('y',30));z=cad.finite(d.get('z',20))
     if min(x,y,z)<=0:raise ValueError('Dimensions must be positive')
     # Three.js box uses (x,z,y), Y is vertical
     if t in ('box','extrudeRect'):
@@ -90,7 +99,8 @@ def export_step(model:Model):
         with tempfile.NamedTemporaryFile(suffix='.step',delete=False) as f: path=f.name
         try:
             if writer.Write(path)!=IFSelect_RetDone:raise RuntimeError('OCCT STEP writer failed')
-            data=open(path,'rb').read()
+            with open(path,'rb') as stream:
+                data=stream.read()
         finally:os.unlink(path)
         return Response(data,media_type='model/step',headers={'Content-Disposition':'attachment; filename="NiliCAD-precise.step"'})
     except Exception as exc:raise HTTPException(422,str(exc))
@@ -183,3 +193,76 @@ def download_step(job_id: str, range_header: str | None = Header(default=None, a
                 remaining -= len(block)
                 yield block
     return StreamingResponse(chunks(), status_code=status, media_type='model/step', headers=headers)
+
+
+class Profiles(BaseModel):
+    profiles: list[dict[str, Any]]
+
+@app.post('/regions')
+def regions(model: Profiles):
+    try:
+        return {'regions':cad.split_profiles(model.profiles)}
+    except Exception as exc:
+        raise HTTPException(422,str(exc))
+
+@app.post('/evaluate')
+def evaluate(node: dict[str, Any]):
+    try:
+        return cad.result(make(node))
+    except Exception as exc:
+        raise HTTPException(422,str(exc))
+
+# CAD files use conventional Z-up; browser and persisted B-Rep use Y-up.
+def import_cad_bytes(data, extension):
+    if not data or len(data) > 20_000_000:
+        raise ValueError('Expected CAD file up to 20 MB')
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, 'input.' + extension)
+        with open(path, 'wb') as stream:
+            stream.write(data)
+        if extension in ('step', 'stp'):
+            shape = cq.importers.importStep(path).val()
+        elif extension in ('iges', 'igs'):
+            from OCP.IGESControl import IGESControl_Reader
+            reader = IGESControl_Reader()
+            if reader.ReadFile(path) != IFSelect_RetDone or not reader.TransferRoots():
+                raise ValueError('Cannot read IGES file')
+            shape = cq.Shape.cast(reader.OneShape())
+        else:
+            raise ValueError('Expected STEP or IGES')
+    return shape.rotate((0,0,0),(1,0,0),-90)
+
+from fastapi import Request
+
+@app.post('/import-cad/{extension}')
+async def import_cad(extension: str, request: Request):
+    try:
+        # Bound the body while receiving, including chunked requests.
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > 20_000_000:
+                raise ValueError('CAD file exceeds 20 MB')
+        return cad.result(import_cad_bytes(bytes(data),extension.lower()))
+    except Exception as exc:
+        raise HTTPException(422,str(exc))
+
+@app.post('/export-iges')
+def export_iges(model: Model):
+    try:
+        from OCP.IGESControl import IGESControl_Writer
+        if not 1 <= len(model.objects) <= 100:
+            raise ValueError('Expected 1–100 objects')
+        writer = IGESControl_Writer('MM', 1)
+        for node in model.objects:
+            if not writer.AddShape(orient_for_step(make(node)).wrapped):
+                raise ValueError('Cannot transfer IGES shape')
+        writer.ComputeModel()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory,'model.iges')
+            if not writer.Write(path):
+                raise ValueError('Cannot write IGES')
+            with open(path,'rb') as stream:
+                return Response(stream.read(),media_type='model/iges')
+    except Exception as exc:
+        raise HTTPException(422,str(exc))
